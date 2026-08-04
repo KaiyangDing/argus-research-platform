@@ -1,0 +1,88 @@
+{
+  "docs": [
+    {
+      "source_id": "lpz-notice-20241105-9889",
+      "doc_title": "良品铺子关于媒体报道的说明公告",
+      "source_type": "official_notice",
+      "source_tier": 2,
+      "url": "https://pdf.dfcfw.com/pdf/H2_AN202411041640709889_1.pdf?1730759564000.pdf",
+      "fetched_at": "2026-08-04",
+      "published_at": "2024-11-05",
+      "sha256": "9c55099326850347dca0722bb2b73ab5e49c7278f7b5101785133ce946e8ee01",
+      "license_note": "法定信息披露文件（公开渠道），快照仅演示用途",
+      "parse_status": "pending"
+    },
+    {
+      "source_id": "szss-notice-20250428-1927",
+      "doc_title": "三只松鼠关于向香港联交所递交境外上市股份(H股)上市申请并刊发申请资料的公告",
+      "source_type": "official_notice",
+      "source_tier": 2,
+      "url": "https://pdf.dfcfw.com/pdf/H2_AN202504281663871927_1.pdf?1745856817000.pdf",
+      "fetched_at": "2026-08-04",
+      "published_at": "2025-04-28",
+      "sha256": "81f0f36f5dbc6f9872e61e6cbc7246fedf03de2087de2a0704394d0cdbd591f6",
+      "license_note": "法定信息披露文件（公开渠道），快照仅演示用途",
+      "parse_status": "pending"
+    },
+    {
+      "source_id": "szss-notice-20250526-6961",
+      "doc_title": "三只松鼠关于发行境外上市股份(H股)备案申请材料获中国证监会接收的公告",
+      "source_type": "official_notice",
+      "source_tier": 2,
+      "url": "https://pdf.dfcfw.com/pdf/H2_AN202505261679486961_1.pdf?1748275375000.pdf",
+      "fetched_at": "2026-08-04",
+      "published_at": "2025-05-26",
+      "sha256": "7d22270f72839bb4c76570d61eac63c427dd0acef9cd69760946f2d3f4632a2a",
+      "license_note": "法定信息披露文件（公开渠道），快照仅演示用途",
+      "parse_status": "pending"
+    },
+    {
+      "source_id": "yh-notice-20241031-1956",
+      "doc_title": "永辉超市股份有限公司关于《详式权益变动报告书》的补充公告",
+      "source_type": "official_notice",
+      "source_tier": 2,
+      "url": "https://pdf.dfcfw.com/pdf/H2_AN202410301640601956_1.pdf?1730309319000.pdf",
+      "fetched_at": "2026-08-04",
+      "published_at": "2024-10-31",
+      "sha256": "e146e86cdd791ee8e65a20f063fd3f3dae1aa5436437958162afe62d06eca0a6",
+      "license_note": "法定信息披露文件（公开渠道），快照仅演示用途",
+      "parse_status": "pending"
+    },
+    {
+      "source_id": "yh-notice-20250122-3222",
+      "doc_title": "永辉超市股份有限公司关于5%以上股东权益变动触及1%的提示性公告",
+      "source_type": "official_notice",
+      "source_tier": 2,
+      "url": "https://pdf.dfcfw.com/pdf/H2_AN202501211642413222_1.pdf?1737487799000.pdf",
+      "fetched_at": "2026-08-04",
+      "published_at": "2025-01-22",
+      "sha256": "48b7e7ae852e556f81da4b36cf72e77e7b4e3850b577fe54d17e9df6b8a66d7d",
+      "license_note": "法定信息披露文件（公开渠道），快照仅演示用途",
+      "parse_status": "pending"
+    },
+    {
+      "source_id": "syn-huasui-2025",
+      "doc_title": "华穗食品股份有限公司（虚构）2025年度经营与合规概况",
+      "source_type": "annual_report",
+      "source_tier": 1,
+      "url": "synthetic://syn-huasui-2025.txt",
+      "fetched_at": "2026-08-04",
+      "published_at": "2026-01-01",
+      "sha256": "1e20e01a667c786bcd99dad04dc837fb772933ae9bd1c4417a3777294b4dbbcb",
+      "license_note": "合成测试文档（虚构公司），仅功能测试、绝不进评测",
+      "parse_status": "parsed"
+    },
+    {
+      "source_id": "syn-beiqiao-notice",
+      "doc_title": "北桥同城物流有限公司（虚构）关于服务质量与投诉处理机制的公告",
+      "source_type": "annual_report",
+      "source_tier": 1,
+      "url": "synthetic://syn-beiqiao-notice.txt",
+      "fetched_at": "2026-08-04",
+      "published_at": "2026-01-01",
+      "sha256": "c66bb431af0dc251ae2aca6f77193a410cc98c9c46a6d949c40effc717172968",
+      "license_note": "合成测试文档（虚构公司），仅功能测试、绝不进评测",
+      "parse_status": "parsed"
+    }
+  ]
+}

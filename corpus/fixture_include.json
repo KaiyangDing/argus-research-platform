@@ -1,0 +1,13 @@
+{
+  "source_ids": [
+    "lpz-notice-20241105-9889",
+    "szss-notice-20250428-1927",
+    "szss-notice-20250526-6961",
+    "yh-notice-20241031-1956",
+    "yh-notice-20250122-3222"
+  ],
+  "synthetic_docs": [
+    "corpus/synthetic/syn-huasui-2025.txt",
+    "corpus/synthetic/syn-beiqiao-notice.txt"
+  ]
+}
