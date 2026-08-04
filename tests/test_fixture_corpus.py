@@ -17,7 +17,8 @@ _FIXTURE = Path("tests/fixtures/corpus")
 
 
 def _meta() -> dict[str, object]:
-    return json.loads((_FIXTURE / "corpus_meta.json").read_text(encoding="utf-8"))
+    data: dict[str, object] = json.loads((_FIXTURE / "corpus_meta.json").read_text(encoding="utf-8"))
+    return data
 
 
 async def _fixture_rows(conn_engine: AsyncEngine, corpus_hash: str) -> int:
@@ -45,7 +46,9 @@ async def test_fixture_rows_match_meta(pg_engine: AsyncEngine, migrated: None) -
     assert count == expected
 
 
-async def test_fixture_hash_differs_from_full_corpus(pg_engine: AsyncEngine, migrated: None) -> None:
+async def test_fixture_hash_differs_from_full_corpus(
+    pg_engine: AsyncEngine, migrated: None
+) -> None:
     meta = _meta()
     fixture_hash = str(meta["corpus_hash"])
     assert fixture_hash.startswith("sha256:")
@@ -74,9 +77,7 @@ async def test_vector_search_topk(pg_engine: AsyncEngine, migrated: None) -> Non
     meta = _meta()
     corpus_hash = str(meta["corpus_hash"])
     await _require_loaded(pg_engine, corpus_hash)
-    first = json.loads(
-        (_FIXTURE / "embeddings.jsonl").read_text(encoding="utf-8").splitlines()[0]
-    )
+    first = json.loads((_FIXTURE / "embeddings.jsonl").read_text(encoding="utf-8").splitlines()[0])
     vec_text = "[" + ",".join(str(x) for x in first["vector"]) + "]"
     async with pg_engine.connect() as conn:
         res = await conn.execute(

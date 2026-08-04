@@ -95,7 +95,9 @@ async def export(derived: Path, include_path: Path, out: Path) -> int:
         fixture_docs.append(entry)
         synthetic_rows.extend(rows)
 
-    rows = sorted(real_rows + synthetic_rows, key=lambda r: (str(r["source_id"]), int(r["char_offset"])))
+    rows = sorted(
+        real_rows + synthetic_rows, key=lambda r: (str(r["source_id"]), int(r["char_offset"]))
+    )
 
     out.mkdir(parents=True, exist_ok=True)
     existing_vectors = {
@@ -115,7 +117,9 @@ async def export(derived: Path, include_path: Path, out: Path) -> int:
     if to_embed:
         settings = ArgusSettings()
         if settings.llm_mode != "live":
-            print(f"合成文档缺 {len(to_embed)} 条 embedding，需 ARGUS_ENV=demo、ARGUS_LLM_MODE=live 运行")
+            print(
+                f"合成文档缺 {len(to_embed)} 条 embedding，需 ARGUS_ENV=demo、ARGUS_LLM_MODE=live 运行"
+            )
             return 2
         client = LLMClient(settings, gates=[BudgetGate("fixture-embed", Decimal(1))])
         try:
@@ -140,7 +144,10 @@ async def export(derived: Path, include_path: Path, out: Path) -> int:
             f.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
     with embeddings_path.open("w", encoding="utf-8", newline="\n") as f:
         for r in rows:
-            f.write(json.dumps({"chunk_id": r["chunk_id"], "vector": vectors[str(r["chunk_id"])]}) + "\n")
+            f.write(
+                json.dumps({"chunk_id": r["chunk_id"], "vector": vectors[str(r["chunk_id"])]})
+                + "\n"
+            )
 
     fixture_hash = compute_corpus_hash(manifest_path, chunks_path, embeddings_path)
     meta = {
@@ -154,7 +161,8 @@ async def export(derived: Path, include_path: Path, out: Path) -> int:
     )
 
     total_bytes = sum(
-        p.stat().st_size for p in (manifest_path, chunks_path, embeddings_path, out / "corpus_meta.json")
+        p.stat().st_size
+        for p in (manifest_path, chunks_path, embeddings_path, out / "corpus_meta.json")
     )
     if total_bytes > _SIZE_CAP_BYTES:
         print(f"夹具体积 {total_bytes / 1e6:.1f}MB 超过 8MB 守卫：减 include 或换合成文档")
