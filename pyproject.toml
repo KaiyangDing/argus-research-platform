@@ -60,3 +60,22 @@ dev = [
     "respx>=0.23.1",
     "ruff>=0.16.1",
 ]
+
+[tool.importlinter]
+root_packages = ["argus", "mcp_servers"]
+
+[[tool.importlinter.contracts]]
+name = "argus 分层单向依赖"
+type = "layers"
+layers = [
+    "argus.apps",
+    "argus.roster",
+    "argus.engine | argus.bus | argus.tools",   # 平级：engine/bus/tools 互不 import
+    "argus.core",
+]
+
+[[tool.importlinter.contracts]]
+name = "mcp_servers 不得依赖编排与角色"
+type = "forbidden"
+source_modules = ["mcp_servers"]
+forbidden_modules = ["argus.engine", "argus.roster", "argus.apps"]

@@ -1,0 +1,34 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    services:
+      pg:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: argus
+          POSTGRES_PASSWORD: argus
+          POSTGRES_DB: argus
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U argus -d argus"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      ARGUS_ENV: dev
+      ARGUS_LLM_MODE: replay                 # CI 钉死 replay（07 §8）
+      ARGUS_PG_DSN: postgresql+asyncpg://argus:argus@127.0.0.1:5432/argus
+      ARGUS_TEST_REQUIRE_PG: "1"             # CI 里 pg 用例跳过=失败（M0.5 conftest 履行）
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.14
+      - run: uv sync --frozen
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run mypy .
+      - run: uv run lint-imports
+      # —— M0.5 在此追加：uv run alembic upgrade head
+      # —— M0.10 在此追加：uv run python -m scripts.corpus.load_pg --fixture tests/fixtures/corpus
+      - run: uv run pytest -q
