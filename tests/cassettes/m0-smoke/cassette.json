@@ -1,0 +1,32 @@
+{
+  "header": {
+    "scenario_id": "m0-smoke",
+    "corpus_hash": null,
+    "models": [
+      "qwen-flash"
+    ],
+    "recorded_at": "2026-08-04T14:17:07.277171+00:00",
+    "spent_yuan": "0.000024"
+  },
+  "entries": [
+    {
+      "key": {
+        "node_id": "smoke",
+        "attempt": 1,
+        "call_index": 0
+      },
+      "endpoint": "chat",
+      "request_digest": "c23e219880fac2bf25d8074e7f50362dbbe21eb4d087ecd807910d67b3233aca",
+      "response_text": "收到",
+      "response_vectors": null,
+      "model": "qwen-flash",
+      "request_id": "chatcmpl-2ad72f66-0bd2-96f0-89d6-0697a2ade0b8",
+      "usage": {
+        "input": 14,
+        "output": 1,
+        "cached": 0
+      },
+      "cost_yuan": "0.000024"
+    }
+  ]
+}

@@ -1,14 +1,17 @@
-"""LLM 薄客户端（M0.6）：档位选择 + 预算闸门 + 429 退避 + 流中断入账 + embedding。
+"""LLM 薄客户端：档位选择 + 预算闸门 + 429 退避 + 流中断入账 + embedding + cassette 三模式。
 
 刻意不重建供应商可靠性设施（00 §2.3 不重叠纪律）：429 只退让、5xx 单次重试。
-cassette 三模式分派 M0.7 接入；本步 replay 模式调用即报错——replay 永远没有真实 HTTP 路径。
+三模式（M0.7 接入）：replay 走带子零 HTTP、record 真实调用并落带、live 真实调用不落带；
+stream 暂仅 live（流式 cassette 化待 M1 消费方出现时定义【实现细则】）。
 """
 
 import asyncio
+import hashlib
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 
@@ -16,7 +19,27 @@ from argus.core.config import ArgusSettings
 from argus.core.logging import get_logger
 from argus.core.types import ArgusError, ModelTier
 
+if TYPE_CHECKING:
+    from argus.core.cassette import CassettePlayer, CassetteRecorder, CassetteStore
+
 _BACKOFF_DELAYS = (0, 0.5, 1, 2, 4, 8)  # 【实现细则】429 退避序列，无抖动（测试确定性）
+
+
+def canonical_json(obj: Any) -> str:
+    """排序键 + 剔除 None 值：同一请求任何构造顺序得同一串（digest 的口径）。"""
+
+    def _strip(o: Any) -> Any:
+        if isinstance(o, dict):
+            return {k: _strip(v) for k, v in o.items() if v is not None}
+        if isinstance(o, list):
+            return [_strip(v) for v in o]
+        return o
+
+    return json.dumps(_strip(obj), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def request_digest(body: Mapping[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(dict(body)).encode()).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +124,7 @@ class ModelPrice:
     output_per_1k: Decimal  # embedding 模型 output=0
 
 
+# 价目来源：百炼官网价目页，2026-08-04 查询并经控制台核对（aiapiprice 聚合 2026-06-15 版交叉）。
 MODEL_PRICES: dict[str, ModelPrice] = {
     "qwen-flash": ModelPrice(input_per_1k=Decimal("0.0012"), output_per_1k=Decimal("0.0072")),
     "qwen-plus": ModelPrice(input_per_1k=Decimal("0.002"), output_per_1k=Decimal("0.008")),
@@ -135,8 +159,6 @@ class LLMStream:
         return self._iterate()
 
     async def _iterate(self) -> AsyncIterator[str]:
-        import json
-
         async for line in self._response.aiter_lines():
             if not line.startswith("data:"):
                 continue
@@ -196,12 +218,16 @@ class LLMClient:
         settings: ArgusSettings,
         *,
         gates: Sequence[BudgetGate] = (),
+        cassette_store: CassetteStore | None = None,
         transport: httpx.AsyncClient | None = None,
         prices: Mapping[str, ModelPrice] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self._settings = settings
         self._gates = list(gates)
+        self._store = cassette_store
+        self._players: dict[str, CassettePlayer] = {}
+        self._recorder: CassetteRecorder | None = None
         self._http = transport or httpx.AsyncClient(timeout=settings.llm_timeout_s)
         self._prices = dict(prices or MODEL_PRICES)
         self._sleep = sleep if sleep is not None else asyncio.sleep
@@ -211,10 +237,66 @@ class LLMClient:
     def model_for(self, tier: ModelTier) -> str:
         return self._settings.model_for(tier)
 
-    def _guard_mode(self) -> None:
-        # M0.7 将此替换为 cassette 三模式分派；本步保证 replay 无任何真实 HTTP 路径
-        if self._settings.llm_mode == "replay":
-            raise ArgusError("replay 需要 cassette（M0.7 接入）；本步仅 record/live 可调用")
+    def _player_for(self, scenario_id: str) -> CassettePlayer:
+        from argus.core.cassette import CassettePlayer  # 延迟导入：保持 cassette→llm 单向
+
+        player = self._players.get(scenario_id)
+        if player is None:
+            if self._store is None:
+                raise ArgusError("replay 模式需要 cassette_store（07 §8）")
+            player = CassettePlayer(self._store.load(scenario_id))
+            self._players[scenario_id] = player
+        return player
+
+    def _replay_entry(self, ctx: CallContext, call_index: int, digest: str) -> LLMResult:
+        from argus.core.cassette import CassetteKey
+
+        entry = self._player_for(ctx.scenario_id).replay(
+            CassetteKey(node_id=ctx.node_id, attempt=ctx.attempt, call_index=call_index), digest
+        )
+        usage = LLMUsage(
+            input_tokens=entry.usage.get("input", 0),
+            output_tokens=entry.usage.get("output", 0),
+            cached_tokens=entry.usage.get("cached", 0),
+        )
+        cost = Decimal(entry.cost_yuan)
+        for g in self._gates:
+            g.precheck(cost)  # 【实现细则】回放也走闸门：预算行为零费用可测
+        for g in self._gates:
+            g.settle(cost)
+        return LLMResult(
+            text=entry.response_text or "",
+            model=entry.model,
+            request_id=entry.request_id,
+            usage=usage,
+            cost_yuan=cost,
+        )
+
+    def _replay_vectors(self, ctx: CallContext, call_index: int, digest: str) -> list[list[float]]:
+        from argus.core.cassette import CassetteKey
+
+        entry = self._player_for(ctx.scenario_id).replay(
+            CassetteKey(node_id=ctx.node_id, attempt=ctx.attempt, call_index=call_index), digest
+        )
+        cost = Decimal(entry.cost_yuan)
+        for g in self._gates:
+            g.precheck(cost)
+        for g in self._gates:
+            g.settle(cost)
+        return list(entry.response_vectors or [])
+
+    def _recorder_for(self, scenario_id: str) -> CassetteRecorder:
+        from argus.core.cassette import CassetteRecorder, CassetteStore
+
+        if self._recorder is None:
+            store = self._store or CassetteStore()
+            self._recorder = CassetteRecorder(
+                store,
+                scenario_id,
+                corpus_hash=self._settings.corpus_hash,
+                session_cap_yuan=self._settings.record_session_cap_yuan,
+            )
+        return self._recorder
 
     def _next_call_index(self, ctx: CallContext) -> int:
         key = (ctx.scenario_id, ctx.node_id, ctx.attempt)
@@ -280,7 +362,6 @@ class LLMClient:
         max_tokens: int = 1024,
         temperature: float | None = None,
     ) -> LLMResult:
-        self._guard_mode()
         model = self.model_for(tier)
         call_index = self._next_call_index(ctx)
         body: dict[str, Any] = {
@@ -290,6 +371,9 @@ class LLMClient:
         }
         if temperature is not None:
             body["temperature"] = temperature
+        digest = request_digest(body)
+        if self._settings.llm_mode == "replay":
+            return self._replay_entry(ctx, call_index, digest)
         est_input = sum(len(m.content) for m in messages) // 2  # 【实现细则】中文≈2字符/token
         for g in self._gates:
             g.precheck(self._estimate_yuan(model, est_input, max_tokens))  # 超限不发请求
@@ -322,6 +406,23 @@ class LLMClient:
             cost_yuan=str(cost),
             call_index=call_index,
         )
+        if self._settings.llm_mode == "record":
+            from argus.core.cassette import CassetteKey
+
+            self._recorder_for(ctx.scenario_id).record(
+                CassetteKey(node_id=ctx.node_id, attempt=ctx.attempt, call_index=call_index),
+                endpoint="chat",
+                request_digest=digest,
+                model=result.model,
+                usage={
+                    "input": usage.input_tokens,
+                    "output": usage.output_tokens,
+                    "cached": usage.cached_tokens,
+                },
+                cost_yuan=cost,
+                response_text=result.text,
+                request_id=result.request_id,
+            )
         return result
 
     async def stream(
@@ -333,7 +434,10 @@ class LLMClient:
         max_tokens: int = 1024,
         temperature: float | None = None,
     ) -> LLMStream:
-        self._guard_mode()
+        if self._settings.llm_mode != "live":
+            raise ArgusError(
+                "stream 暂仅支持 live：流式 cassette 化待 M1 消费方出现时定义【实现细则】"
+            )
         model = self.model_for(tier)
         self._next_call_index(ctx)
         body: dict[str, Any] = {
@@ -368,17 +472,21 @@ class LLMClient:
         )
 
     async def embed(self, texts: Sequence[str], ctx: CallContext) -> list[list[float]]:
-        self._guard_mode()
         model = self._settings.embed_model
         out: list[list[float]] = []
         step = self._settings.embed_batch_size
         for start in range(0, len(texts), step):
             batch = list(texts[start : start + step])
-            self._next_call_index(ctx)
+            call_index = self._next_call_index(ctx)
+            body = {"model": model, "input": batch}
+            digest = request_digest(body)
+            if self._settings.llm_mode == "replay":
+                out.extend(self._replay_vectors(ctx, call_index, digest))
+                continue
             est_input = sum(len(t) for t in batch) // 2
             for g in self._gates:
                 g.precheck(self._estimate_yuan(model, est_input, 0))
-            resp = await self._request_with_backoff("/embeddings", {"model": model, "input": batch})
+            resp = await self._request_with_backoff("/embeddings", body)
             data = resp.json()
             usage_raw = data.get("usage") or {}
             usage = LLMUsage(input_tokens=int(usage_raw.get("prompt_tokens", 0)), output_tokens=0)
@@ -397,7 +505,21 @@ class LLMClient:
                 input_tokens=usage.input_tokens,
                 cost_yuan=str(cost),
             )
+            if self._settings.llm_mode == "record":
+                from argus.core.cassette import CassetteKey
+
+                self._recorder_for(ctx.scenario_id).record(
+                    CassetteKey(node_id=ctx.node_id, attempt=ctx.attempt, call_index=call_index),
+                    endpoint="embeddings",
+                    request_digest=digest,
+                    model=model,
+                    usage={"input": usage.input_tokens, "output": 0, "cached": 0},
+                    cost_yuan=cost,
+                    response_vectors=out[-len(batch) :],
+                )
         return out
 
     async def aclose(self) -> None:
+        if self._recorder is not None and self._recorder.has_entries:
+            self._recorder.finalize()
         await self._http.aclose()
