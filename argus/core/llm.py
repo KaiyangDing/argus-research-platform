@@ -101,13 +101,11 @@ class ModelPrice:
     output_per_1k: Decimal  # embedding 模型 output=0
 
 
-# ⚠ 提交前必须从百炼官网价目页抄入真实数值（外部单价非设计数字）；
-# 调价只改此一处，并在 commit message 记录来源与日期。测试一律注入 fake 价目。
 MODEL_PRICES: dict[str, ModelPrice] = {
-    "qwen-flash": ModelPrice(input_per_1k=Decimal(0), output_per_1k=Decimal(0)),
-    "qwen-plus": ModelPrice(input_per_1k=Decimal(0), output_per_1k=Decimal(0)),
-    "qwen-max": ModelPrice(input_per_1k=Decimal(0), output_per_1k=Decimal(0)),
-    "text-embedding-v4": ModelPrice(input_per_1k=Decimal(0), output_per_1k=Decimal(0)),
+    "qwen-flash": ModelPrice(input_per_1k=Decimal("0.0012"), output_per_1k=Decimal("0.0072")),
+    "qwen-plus": ModelPrice(input_per_1k=Decimal("0.002"), output_per_1k=Decimal("0.008")),
+    "qwen-max": ModelPrice(input_per_1k=Decimal("0.012"), output_per_1k=Decimal("0.036")),
+    "text-embedding-v4": ModelPrice(input_per_1k=Decimal("0.0005"), output_per_1k=Decimal(0)),
 }
 
 
