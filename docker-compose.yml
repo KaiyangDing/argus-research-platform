@@ -1,0 +1,20 @@
+services:
+  pg:
+    image: pgvector/pgvector:pg16          # 07 §1 指定镜像：PG16 + pgvector 扩展预装
+    ports:
+      - "127.0.0.1:5432:5432"              # 只绑回环（07 §1）——开发期宿主进程（tests/脚本/alembic）
+                                           # 需要直连；02 §6.1 的"不映射宿主"是 M6 全容器 demo 形态
+    environment:
+      POSTGRES_USER: argus
+      POSTGRES_PASSWORD: argus             # 仅本机开发凭据；不是密钥，不进 .env 纪律范围
+      POSTGRES_DB: argus
+    volumes:
+      - pgdata:/var/lib/postgresql/data    # PG 数据持久化，容器重建不丢库
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U argus -d argus"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:

@@ -30,5 +30,6 @@ jobs:
       - run: uv run mypy .
       - run: uv run lint-imports
       # —— M0.5 在此追加：uv run alembic upgrade head
+      - run: uv run alembic upgrade head
       # —— M0.10 在此追加：uv run python -m scripts.corpus.load_pg --fixture tests/fixtures/corpus
       - run: uv run pytest -q
