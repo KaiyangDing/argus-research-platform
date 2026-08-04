@@ -17,7 +17,9 @@ _FIXTURE = Path("tests/fixtures/corpus")
 
 
 def _meta() -> dict[str, object]:
-    data: dict[str, object] = json.loads((_FIXTURE / "corpus_meta.json").read_text(encoding="utf-8"))
+    data: dict[str, object] = json.loads(
+        (_FIXTURE / "corpus_meta.json").read_text(encoding="utf-8")
+    )
     return data
 
 
