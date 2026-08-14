@@ -176,7 +176,7 @@ def validate_graph(
     # I3：Σ节点申请 ≤ 任务根 cap（父子池层级与合成保底 M2 接入）
     if task_caps is not None:
         total_tokens = sum(n.budget.tokens for n in graph.nodes)
-        total_yuan = sum((n.budget.yuan for n in graph.nodes), Decimal("0"))
+        total_yuan = sum((n.budget.yuan for n in graph.nodes), Decimal(0))
         if total_tokens > task_caps.tokens or total_yuan > task_caps.yuan:
             violations.append(
                 Violation(
