@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from argus.core.types import ArtifactKind, ArtifactRef, ContractId, NodeId, RoleName, TaskId
 from argus.engine.clock import Clock
 from argus.engine.graph import FailureClass, NodeStatus, TaskBrief
+from argus.engine.steps import StepJournal
 
 _KIND_DEFAULT_SEVERITY: Final[dict[str, int]] = {
     "node_replan": 2,
@@ -127,7 +128,7 @@ class NodeContext:
     inputs: tuple[ArtifactRef, ...]  # M1 不解析（bus 是 M3）
     budget: BudgetView
     cancel_token: Any  # CancelToken——M1.12 落地后收紧（TYPE_CHECKING 导入）
-    step_journal: Any  # StepJournal | None——EFFECTFUL 才注入，M1.9 落地后收紧
+    step_journal: StepJournal | None  # EFFECTFUL 才注入（M1.9 收紧；PURE 恒 None）
     clock: Clock
 
 

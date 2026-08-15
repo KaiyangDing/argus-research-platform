@@ -31,6 +31,7 @@ ScriptAction = Literal[
     "timeout",
     "hang",
     "crash",
+    "effectful_steps",
 ]
 
 
@@ -38,6 +39,8 @@ class ScriptEntry(BaseModel):
     action: ScriptAction
     artifact_kind: ArtifactKind = ArtifactKind.RESEARCH_NOTE
     hang_seconds: float = 3600.0  # hang/timeout 用（经 ctx.clock.sleep，FakeClock 可驱动）
+    steps: int = 3  # effectful_steps 用：总步数
+    crash_after_step: int | None = None  # 第 k 步 complete 后 raise（崩溃点在步骤边界后）
 
 
 ScriptTable = Mapping[tuple[NodeId, int], ScriptEntry]
@@ -98,8 +101,28 @@ class ScriptedExecutor:
                 return OutcomeSuccess(artifact=self._artifact(ctx, entry))
             case "crash":
                 raise RuntimeError("scripted crash")
+            case "effectful_steps":
+                return await self._run_steps(ctx, entry, from_step=0)
         raise AssertionError(f"unknown action: {entry.action}")
 
     async def resume(self, ctx: NodeContext, from_step: int) -> NodeOutcome:
-        """M1.5 形态：PURE 剧本 resume ≡ execute（步骤级续跑 M1.9 扩展）。"""
+        """EFFECTFUL 剧本从 from_step+1 续干；其余剧本 resume ≡ execute（03 §4.2）。"""
+        entry = self._entry(ctx)
+        if entry.action == "effectful_steps":
+            return await self._run_steps(ctx, entry, from_step=from_step)
         return await self.execute(ctx)
+
+    async def _run_steps(
+        self, ctx: NodeContext, entry: ScriptEntry, *, from_step: int
+    ) -> NodeOutcome:
+        """begin → 模拟副作用（无真实 IO）→ complete；crash_after_step 在边界后炸。"""
+        journal = ctx.step_journal
+        assert journal is not None, "effectful_steps 剧本必须注入 StepJournal"
+        for step_no in range(from_step + 1, entry.steps + 1):
+            begun = await journal.begin(step_no, f"step-{step_no}")
+            if not begun.skip:
+                # 模拟副作用发生在这里（M1 无真实 IO），随后打完成标记
+                await journal.complete(step_no, f"digest-{step_no}")
+            if entry.crash_after_step == step_no:
+                raise RuntimeError(f"scripted crash after step {step_no}")
+        return OutcomeSuccess(artifact=self._artifact(ctx, entry))
