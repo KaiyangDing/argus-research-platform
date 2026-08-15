@@ -351,7 +351,7 @@ class SimRig:
         node_timeout_seconds: int = 1,
         step_seconds: float = 2.0,
         io_pause: float = 0.02,
-        max_iters: int = 800,
+        max_iters: int = 2000,  # 超时剧本烧真实秒（每节点 ~2s≈100 迭代），预算给足
     ) -> None:
         self._engine = engine
         self._factory = build_sessionmaker(engine)
@@ -389,20 +389,33 @@ class SimRig:
         for _ in range(n_workers):
             _spawn()
 
-        # 注入计划：时点吃独立 rng（同 seed 同计划）；对象在执行时按当时局面确定
+        # 注入计划：iter 3 起逐迭代依次发起（时点确定；无对象走 defer/drop）——
+        # 图寿命随虚拟/真实节奏漂移，随机时间轴会让后发注入落空，锚早不锚散。
+        # rng 只用于注入对象选择（同 seed 同选择序）
         rng = random.Random(params.seed ^ 0x5EED)
         plan: dict[int, list[str]] = {}
+        next_at = 3
         for _ in range(params.crash_injections):
-            plan.setdefault(rng.randint(3, 15), []).append("kill")
+            plan.setdefault(next_at, []).append("kill")
+            next_at += 1
         for _ in range(params.cancel_injections):
-            plan.setdefault(rng.randint(3, 15), []).append("cancel")
+            plan.setdefault(next_at, []).append("cancel")
+            next_at += 1
         for _ in range(params.cancel_crash_combo):
-            plan.setdefault(rng.randint(3, 15), []).append("combo")
+            plan.setdefault(next_at, []).append("combo")
+            next_at += 1
         kills = cancels = combos = 0
 
         try:
             stable = 0
             for iter_no in range(self._max_iters):
+                for slot in slots:  # 哨兵：worker 永不正常返回，done 且非被杀 = 崩溃
+                    if slot.task.done() and not slot.task.cancelled():
+                        exc = slot.task.exception()
+                        if exc is not None:
+                            raise AssertionError(
+                                f"worker 崩溃（seed={params.seed}, iter={iter_no}）"
+                            ) from exc
                 for action in plan.pop(iter_no, []):
                     verdict = await self._inject(action, graph, rng, slots, _spawn)
                     if verdict == "defer":
