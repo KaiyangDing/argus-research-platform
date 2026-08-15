@@ -200,6 +200,21 @@ async def _finalize_after_commit(
         await session.commit()
 
 
+async def _promote_and_finalize_after_commit(
+    session_factory: async_sessionmaker[AsyncSession], task_id: TaskId, done_node: NodeId
+) -> None:
+    """C-7 同族：并发 DONE 的 T1 促升竞态补刀（commit_done 专用）。
+
+    菱形汇合点的两个父并发完成时，各自事务内的促升 NOT EXISTS 都看到对方仍
+    非 DONE → 双双不促升 → 汇合点永久 PENDING（undone_parents=0 却无人管）。
+    提交后重跑幂等促升：最后提交的父必见全部已提交 DONE。促升在前、收尾判定
+    在后（刚促出的 READY 会正确阻止任务提前收尾）。"""
+    async with session_factory() as session:
+        await session.execute(_PROMOTE_T1_SQL, {"done_node": done_node})
+        await _maybe_finalize_task(session, task_id)
+        await session.commit()
+
+
 async def commit_done(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -263,7 +278,8 @@ async def commit_done(
         # ⑦ 任务收尾判定
         await _maybe_finalize_task(session, task_id)
         await session.commit()
-    await _finalize_after_commit(session_factory, task_id)  # C-7 竞态补刀
+    # C-7 竞态补刀（促升 + 收尾判定，见 _promote_and_finalize_after_commit docstring）
+    await _promote_and_finalize_after_commit(session_factory, task_id, node_id)
     return True
 
 
