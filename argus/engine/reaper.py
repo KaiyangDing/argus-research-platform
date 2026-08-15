@@ -13,7 +13,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from argus.core.types import NodeId, TaskId
 from argus.engine.graph import FailureClass
-from argus.engine.lease import ReaperGuard, commit_cancelled, commit_failed, commit_needs_replan
+from argus.engine.lease import (
+    ReaperGuard,
+    _retry_on_deadlock,
+    commit_cancelled,
+    commit_failed,
+    commit_needs_replan,
+)
 from argus.engine.ports import BudgetHooks, ReplanSignalDraft
 
 
@@ -66,6 +72,7 @@ async def reap_once(
     return ReapStats(requeued, failed, needs_replan, cancelled)
 
 
+@_retry_on_deadlock  # G.4① 逐字多行 UPDATE 无法排序加锁：死锁受害时重试（C-7 族③）
 async def _reap_requeue(session_factory: async_sessionmaker[AsyncSession]) -> int:
     """分支①：单语句事务（不包长事务，reaper 挂在 worker 循环里，长事务拖累领取）。"""
     async with session_factory() as session:

@@ -5,7 +5,9 @@
 失败路径 M1.8 追加；取消路径 M1.12 追加。
 """
 
+import functools
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
@@ -13,6 +15,7 @@ from typing import Any, NamedTuple, cast
 
 from sqlalchemy import text
 from sqlalchemy.engine import CursorResult, Result
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from argus.core.types import ArgusError, NodeId, TaskId
@@ -55,6 +58,29 @@ def _rowcount(res: Result[Any]) -> int:
     return cast(CursorResult[Any], res).rowcount
 
 
+_DEADLOCK_PGCODE = "40P01"
+
+
+def _retry_on_deadlock[**P, R](fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+    """C-7 族③：死锁受害者重试（至多 3 次）。
+
+    多行节点 UPDATE 已按 id 全局序预锁降频；残余环（G.3 逐字守卫先锁自有行，
+    与子行不保序）交给 PG 死锁检测裁决——受害者事务已整体回滚、守卫幂等，
+    整函数重试安全。非死锁的 DBAPIError 原样上抛。"""
+
+    @functools.wraps(fn)
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        for attempt in range(3):
+            try:
+                return await fn(*args, **kwargs)
+            except DBAPIError as exc:
+                if getattr(exc.orig, "pgcode", None) != _DEADLOCK_PGCODE or attempt == 2:
+                    raise
+        raise AssertionError("unreachable")
+
+    return wrapper
+
+
 _HEARTBEAT_SQL = text(  # G.2 原文【逐字】
     """
     UPDATE plan_nodes
@@ -94,14 +120,21 @@ _DONE_WORKER_SQL = text(  # WHERE 三条件【逐字 G.3】；SET 按迁移扩�
 )
 
 _PROMOTE_T1_SQL = text(  # 03-T1：最后一个前驱落 DONE 才促升，同事务（M1 册【实现细则】）
+    # 候选先按 id 全局序 FOR UPDATE 预锁（C-7 族③）：多行促升与取消链/其他促升
+    # 共用同一加锁序，节点行间环等待在结构上不可能；语义与 03-T1 原式逐字等价
     """
     UPDATE plan_nodes SET status = 'READY', ready_at = now()
-    WHERE status = 'PENDING'
-      AND id IN (SELECT e.to_node FROM plan_edges e WHERE e.from_node = :done_node)
-      AND NOT EXISTS (
-          SELECT 1 FROM plan_edges e2
-          JOIN plan_nodes p ON p.id = e2.from_node
-          WHERE e2.to_node = plan_nodes.id AND p.status <> 'DONE')
+    WHERE id IN (
+        SELECT p.id FROM plan_nodes p
+        WHERE p.status = 'PENDING'
+          AND p.id IN (SELECT e.to_node FROM plan_edges e WHERE e.from_node = :done_node)
+          AND NOT EXISTS (
+              SELECT 1 FROM plan_edges e2
+              JOIN plan_nodes p2 ON p2.id = e2.from_node
+              WHERE e2.to_node = p.id AND p2.status <> 'DONE')
+        ORDER BY p.id
+        FOR UPDATE
+    )
     """
 )
 
@@ -215,6 +248,7 @@ async def _promote_and_finalize_after_commit(
         await session.commit()
 
 
+@_retry_on_deadlock
 async def commit_done(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -325,12 +359,15 @@ _WORKER_WHERE = (
 _REAPER_WHERE = "id = :node_id AND status = 'RUNNING' AND lease_expires_at < now()"
 
 _RETRY_SQL = {  # T3b：非终态——不动 attempt（Z-11）、不动 ready_at、不写 finished_at
+    # 追加 cancel_requested_at IS NULL（C-7 族④）：带取消意图的行绝不回 READY——
+    # G.1 跳过带意图的 READY、reaper 只巡 RUNNING，回去就是永久死区；
+    # 意图压倒重试（判定表口径），拒绝后由调用方兜底走 T7
     WorkerGuard: text(
         f"""
         UPDATE plan_nodes
         SET status = 'READY', lease_owner = NULL, lease_expires_at = NULL,
             error = CAST(:error AS jsonb)
-        WHERE {_WORKER_WHERE}
+        WHERE {_WORKER_WHERE} AND cancel_requested_at IS NULL
         """
     ),
     ReaperGuard: text(
@@ -338,7 +375,7 @@ _RETRY_SQL = {  # T3b：非终态——不动 attempt（Z-11）、不动 ready_a
         UPDATE plan_nodes
         SET status = 'READY', lease_owner = NULL, lease_expires_at = NULL,
             error = CAST(:error AS jsonb)
-        WHERE {_REAPER_WHERE}
+        WHERE {_REAPER_WHERE} AND cancel_requested_at IS NULL
         """
     ),
 }
@@ -398,6 +435,7 @@ async def _attempt_of(session: AsyncSession, guard: Guard, node_id: NodeId) -> i
     return int(res.scalar_one())
 
 
+@_retry_on_deadlock
 async def commit_retry(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -423,6 +461,7 @@ async def commit_retry(
         return True
 
 
+@_retry_on_deadlock
 async def commit_failed(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -479,6 +518,7 @@ async def commit_failed(
     return True
 
 
+@_retry_on_deadlock
 async def commit_needs_replan(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -547,6 +587,7 @@ _CANCELLED_SQL = {  # T7：终态——取消产物一律丢弃（冻结区 2.5 
 }
 
 
+@_retry_on_deadlock
 async def commit_cancelled(
     session_factory: async_sessionmaker[AsyncSession],
     *,

@@ -280,13 +280,24 @@ class Worker:
                 )
             case TerminalKind.RETRY:
                 failure = cast(OutcomeFailure, outcome)
-                await commit_retry(
+                retried = await commit_retry(
                     self._factory,
                     task_id=claimed.task_id,
                     node_id=claimed.node_id,
                     guard=guard,
                     error=failure.error,
                 )
+                if not retried:
+                    # C-7 族④：意图落库但心跳未及置 token 时，判定表看不到取消——
+                    # T3b 新守卫拒绝带意图行回队，在事实源上重执行"取消压倒重试"走 T7；
+                    # 纯 fencing 场景下 T7 守卫同样 rowcount=0，无害
+                    await commit_cancelled(
+                        self._factory,
+                        task_id=claimed.task_id,
+                        node_id=claimed.node_id,
+                        guard=guard,
+                        hooks=self._hooks,
+                    )
             case TerminalKind.FAILED:
                 failure = cast(OutcomeFailure, outcome)
                 # failure_class 为 None 的可达路径只有"可重试异常耗尽额度"（03-T5）

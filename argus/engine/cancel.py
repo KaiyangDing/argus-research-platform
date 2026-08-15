@@ -12,7 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from argus.core.types import NodeId, TaskId
-from argus.engine.lease import _finalize_after_commit, _maybe_finalize_task
+from argus.engine.lease import _finalize_after_commit, _maybe_finalize_task, _retry_on_deadlock
 from argus.engine.ports import BudgetHooks
 
 
@@ -40,6 +40,10 @@ _SUBTREE_SQL = text(  # 递归 CTE，含 root 自身（M1 册 M1.12 接口规格
       SELECT e.to_node FROM plan_edges e JOIN sub s ON e.from_node = s.id)
     SELECT id FROM sub
     """
+)
+
+_LOCK_NODES_SQL = text(  # C-7 族③：多行 UPDATE 前按 id 全局序预锁，杜绝节点行间环等待
+    "SELECT id FROM plan_nodes WHERE id = ANY(:node_ids) ORDER BY id FOR UPDATE"
 )
 
 _INTENT_SQL = text(  # G.7①【逐字】+ 幂等追加条件（02 §2.3"取消幂等"）
@@ -74,6 +78,7 @@ async def subtree_ids(session: AsyncSession, root: NodeId) -> list[NodeId]:
     return [NodeId(row.id) for row in res]
 
 
+@_retry_on_deadlock  # 子树多行 UPDATE 与终态事务的残余环：死锁受害时重试（C-7 族③）
 async def request_cancel(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -92,6 +97,8 @@ async def request_cancel(
     async with session_factory() as session:
         # 锁序统一：任务行 FOR SHARE 先行（T8 是终态迁移，与手术互斥）
         await session.execute(_LOCK_TASK_SQL, {"task_id": task_id})
+        # 节点行按 id 序预锁（C-7 族③）：与促升等多行 UPDATE 共用同一全局序，免死锁
+        await session.execute(_LOCK_NODES_SQL, {"node_ids": ids})
         await session.execute(_INTENT_SQL, {"node_ids": ids, "r": reason})
         pruned = (await session.execute(_T8_SQL, {"node_ids": ids})).all()
         if pruned:
