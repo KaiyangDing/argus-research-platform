@@ -10,7 +10,8 @@ surgery 注入是 M2 接入位（冻结区 2.5 #17），M1 恒缺席。
 import asyncio
 import random
 import uuid
-from collections.abc import Callable, Mapping
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -25,6 +26,7 @@ from argus.core.types import ArtifactKind, ContractId, NodeId, RoleName, TaskId
 from argus.engine.cancel import request_cancel, subtree_ids
 from argus.engine.graph import (
     BudgetRequest,
+    NodeStatus,
     PlanEdge,
     PlanGraph,
     PlanNode,
@@ -32,6 +34,7 @@ from argus.engine.graph import (
     TaskBrief,
 )
 from argus.engine.ports import (
+    ArtifactDraft,
     BudgetHint,
     ContractPair,
     NodeContext,
@@ -39,7 +42,8 @@ from argus.engine.ports import (
     NodeOutcome,
     NullBudgetHooks,
 )
-from argus.engine.store import persist_graph
+from argus.engine.store import load_graph, persist_graph
+from argus.engine.validate import validate_graph
 from argus.engine.worker import EngineTuning, Worker
 from tests.support.fake_clock import FakeClock
 from tests.support.scripted_executor import ScriptedExecutor, ScriptEntry
@@ -161,6 +165,8 @@ def generate(params: GraphParams) -> tuple[PlanGraph, Script]:
                 )
             continue
         roll = rng.random()
+        slow_hit = rng.random() < params.slow_ratio
+        slow_secs = rng.uniform(*params.slow_seconds)
         if roll < params.fail_rate:
             flavor = rng.random()
             if flavor < 0.5:  # flaky：第 1 次败、第 2 次缺省 success
@@ -171,13 +177,15 @@ def generate(params: GraphParams) -> tuple[PlanGraph, Script]:
             else:  # 超时：虚拟时钟上永不醒，靠 SimRig 压缩的真实 node_timeout 判死
                 script[(node.id, 1)] = ScriptEntry(action="hang", hang_seconds=_HANG_FOREVER)
                 script[(node.id, 2)] = ScriptEntry(action="hang", hang_seconds=_HANG_FOREVER)
-        elif rng.random() < params.slow_ratio:
-            secs = rng.uniform(*params.slow_seconds)
-            script[(node.id, 1)] = ScriptEntry(action="hang", hang_seconds=secs)
         elif node.purity is Purity.EFFECTFUL:
             steps = rng.randint(2, 4)
+            step_secs = slow_secs / steps if slow_hit else 0.0  # 慢与步骤剧本可组合
             for attempt in (1, 2):  # 同步骤结构：崩溃后 attempt 2 走 resume 续跑
-                script[(node.id, attempt)] = ScriptEntry(action="effectful_steps", steps=steps)
+                script[(node.id, attempt)] = ScriptEntry(
+                    action="effectful_steps", steps=steps, step_seconds=step_secs
+                )
+        elif slow_hit:
+            script[(node.id, 1)] = ScriptEntry(action="hang", hang_seconds=slow_secs)
         # 其余缺省 success（ScriptedExecutor 的默认剧本）
 
     graph = PlanGraph(
@@ -236,11 +244,13 @@ class SimResult(NamedTuple):
     graph: PlanGraph
     script: Script
     statuses: dict[NodeId, str]
+    attempts: dict[NodeId, int]  # 终局 attempt：expected_artifact_set 复算 content_hash 用
     task_status: str
     execution_log: list[ExecutionRecord]
     kills_done: int
     cancels_done: int
     combos_done: int
+    seed: int
 
 
 class _RecordingExecutor:
@@ -295,7 +305,7 @@ _COUNTS_SQL = text(
     """
 )
 
-_STATUSES_SQL = text("SELECT id, status FROM plan_nodes WHERE task_id = :t")
+_STATUSES_SQL = text("SELECT id, status, attempt FROM plan_nodes WHERE task_id = :t")
 
 _RUNNING_ROWS_SQL = text(
     """
@@ -383,11 +393,11 @@ class SimRig:
         rng = random.Random(params.seed ^ 0x5EED)
         plan: dict[int, list[str]] = {}
         for _ in range(params.crash_injections):
-            plan.setdefault(rng.randint(4, 60), []).append("kill")
+            plan.setdefault(rng.randint(3, 15), []).append("kill")
         for _ in range(params.cancel_injections):
-            plan.setdefault(rng.randint(4, 60), []).append("cancel")
+            plan.setdefault(rng.randint(3, 15), []).append("cancel")
         for _ in range(params.cancel_crash_combo):
-            plan.setdefault(rng.randint(4, 60), []).append("combo")
+            plan.setdefault(rng.randint(3, 15), []).append("combo")
         kills = cancels = combos = 0
 
         try:
@@ -421,8 +431,8 @@ class SimRig:
                 with suppress(asyncio.CancelledError):
                     await slot.task
 
-        statuses = await self._statuses(graph.task_id)
         async with self._factory() as session:
+            rows = (await session.execute(_STATUSES_SQL, {"t": graph.task_id})).all()
             task_status = (
                 await session.execute(
                     text("SELECT status FROM research_tasks WHERE id = :t"),
@@ -433,12 +443,14 @@ class SimRig:
             task_id=graph.task_id,
             graph=graph,
             script=script,
-            statuses=statuses,
+            statuses={NodeId(r.id): str(r.status) for r in rows},
+            attempts={NodeId(r.id): int(r.attempt) for r in rows},
             task_status=str(task_status),
             execution_log=log,
             kills_done=kills,
             cancels_done=cancels,
             combos_done=combos,
+            seed=params.seed,
         )
 
     async def _counts(self, task_id: TaskId) -> tuple[int, int]:
@@ -493,10 +505,14 @@ class SimRig:
                 return "drop"  # 无 RUNNING 且无供给（滞留 PENDING 被失败堵死）：combo 无对象
             return "defer"
         row = rng.choice(rows)
+        # 子树取消（生产语义；单点取消会留下"父取消子滞留"的违规孤儿）——
+        # 分支③的打击点在"该 RUNNING 节点带意图 + owner 被杀 + 租约过期"，不受影响
+        async with self._factory() as session:
+            combo_ids = await subtree_ids(session, NodeId(row.id))
         await request_cancel(
             self._factory,
             task_id=graph.task_id,
-            node_ids=[NodeId(row.id)],
+            node_ids=combo_ids,
             reason="synthetic-combo",
             hooks=NullBudgetHooks(),
         )
@@ -519,3 +535,124 @@ class SimRig:
             await session.execute(_EXPIRE_OWNER_SQL, {"owner": slot.worker._worker_id})
             await session.commit()
         spawn()  # 补位新 worker（模拟 docker start 重启；chaos 演练同口径）
+
+
+# ---------------------------------------------------------------------------
+# 13c · 终局不变量断言器（03 §10.1 断言集的 M1 形态 + §10.3 工件集合比对）
+# ---------------------------------------------------------------------------
+
+_INVARIANT_ROWS_SQL = text(
+    """
+    SELECT id, status, attempt, checkpoint_artifact_id, finished_at, cancel_requested_at
+    FROM plan_nodes WHERE task_id = :t
+    """
+)
+
+_ARTIFACT_ROWS_SQL = text(
+    """
+    SELECT producer_node, schema_name, schema_version, content_hash, kind
+    FROM artifacts WHERE task_id = :t
+    """
+)
+
+_EXPIRED_RUNNING_SQL = text(  # I4：过期超一个 reaper 周期（15s）仍 RUNNING = 悬挂
+    """
+    SELECT count(*) FROM plan_nodes
+    WHERE task_id = :t AND status = 'RUNNING'
+      AND lease_expires_at < now() - interval '15 seconds'
+    """
+)
+
+_TERMINAL = {"DONE", "FAILED", "CANCELLED"}
+
+
+async def assert_invariants(
+    engine: AsyncEngine,
+    task_id: TaskId,
+    execution_log: Sequence[ExecutionRecord] | None = None,
+    *,
+    expected_artifacts: set[tuple[NodeId, str, str]] | None = None,
+) -> None:
+    """终局断言 = 03 §10.1 断言集的 M1 形态（序无关；chaos 演练 M1.14 复用）。
+
+    I1/I2 结构合法（恢复自检口径）；I3 空断言（无预算池，M2 接入）；
+    I4 无过期悬挂 RUNNING；I5 DONE 必有检查点工件（"DONE 不可二次变更"由
+    M1.2 触发器机制保证，schema 测试已覆盖，此处不重验）；I6 任务终态无活跃行；
+    I7 零双执行（执行日志 + 工件侧：DONE 恰一件、非 DONE 零件）。
+    """
+    factory = build_sessionmaker(engine)
+    async with factory() as session:
+        graph = await load_graph(session, task_id)
+        rows = (await session.execute(_INVARIANT_ROWS_SQL, {"t": task_id})).all()
+        arts = (await session.execute(_ARTIFACT_ROWS_SQL, {"t": task_id})).all()
+        expired_running = (await session.execute(_EXPIRED_RUNNING_SQL, {"t": task_id})).scalar_one()
+        task_status = (
+            await session.execute(
+                text("SELECT status FROM research_tasks WHERE id = :t"), {"t": task_id}
+            )
+        ).scalar_one()
+
+    by_id = {NodeId(r.id): r for r in rows}
+    assert set(by_id) == {n.id for n in graph.nodes}, "图与节点行集不一致"
+
+    # I1/I2：终局图 + 状态视角过 validate_graph（恢复自检口径）
+    statuses = {nid: NodeStatus(r.status) for nid, r in by_id.items()}
+    report = validate_graph(graph, statuses=statuses)
+    assert report.ok, f"I1/I2 violated: {[str(v.code) for v in report.violations]}"
+
+    # I4：无"RUNNING 且租约过期超一个 reaper 周期"的悬挂行
+    assert int(expired_running) == 0, "I4: dangling expired RUNNING beyond reaper period"
+
+    # I5 + I7 工件侧：DONE 必有检查点且恰一件产出；非 DONE 零产出（早期 attempt 无工件）
+    per_node = Counter(NodeId(a.producer_node) for a in arts)
+    for nid, r in by_id.items():
+        if str(r.status) == "DONE":
+            assert r.checkpoint_artifact_id is not None, f"I5: DONE {nid} 无检查点"
+            assert r.finished_at is not None, f"I5: DONE {nid} 无 finished_at"
+            assert per_node.get(nid, 0) == 1, f"I7: DONE {nid} 工件数 {per_node.get(nid, 0)}"
+        else:
+            assert per_node.get(nid, 0) == 0, f"I7: {r.status} {nid} 却有产出工件"
+
+    # I6：任务终态 → 无 RUNNING/READY 行（预算预留部分 M2 接入）
+    if str(task_status) in {"DONE", "DONE_DEGRADED", "FAILED", "CANCELLED"}:
+        active = [nid for nid, r in by_id.items() if str(r.status) in {"RUNNING", "READY"}]
+        assert not active, f"I6: 任务终态仍有活跃行 {active}"
+
+    # I7 执行日志侧：不存在同 (node_id, attempt) 的两次完整执行
+    if execution_log is not None:
+        counts = Counter((rec.node_id, rec.attempt) for rec in execution_log)
+        dup = {key: n for key, n in counts.items() if n > 1}
+        assert not dup, f"I7: 双执行 {dup}"
+
+    # 工件集合一致（03 §10.3）：按 (producer, schema@ver, content_hash) 集合比对，不比顺序
+    if expected_artifacts is not None:
+        got = {
+            (
+                NodeId(a.producer_node),
+                f"{a.schema_name}@{a.schema_version}",
+                str(a.content_hash),
+            )
+            for a in arts
+        }
+        assert got == expected_artifacts, (
+            f"工件集合漂移：多 {got - expected_artifacts}，少 {expected_artifacts - got}"
+        )
+
+
+def expected_artifact_set(result: SimResult) -> set[tuple[NodeId, str, str]]:
+    """由终局推演预期工件集：每个 DONE 节点恰一件，content_hash 按剧本口径复算。
+
+    ScriptedExecutor 的 payload = {node, attempt, seed} 确定可复算（03 §10.3 的
+    并发回放集合比对靠它）；sink 的 kind 不同但 schema/payload 口径一致。
+    """
+    expected: set[tuple[NodeId, str, str]] = set()
+    for node in result.graph.nodes:
+        if result.statuses.get(node.id) != "DONE":
+            continue
+        payload = {
+            "node": str(node.id),
+            "attempt": result.attempts[node.id],
+            "seed": result.seed,
+        }
+        expected.add((node.id, "scripted_note@1", ArtifactDraft.hash_payload(payload)))
+    return expected
