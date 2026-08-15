@@ -15,6 +15,7 @@ import socket
 import sys
 import traceback
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, cast
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -46,6 +47,7 @@ from argus.engine.ports import (
     OutcomeSuccess,
     ReplanSignalDraft,
 )
+from argus.engine.reaper import reap_once
 from argus.engine.scheduler import ClaimedNode, claim_batch, compute_batch
 from argus.engine.steps import StepJournal
 
@@ -101,6 +103,7 @@ class Worker:
         self._worker_id = make_worker_id()
         self._semaphore = asyncio.Semaphore(concurrency)
         self._in_flight = 0
+        self._last_reap: datetime | None = None
 
     async def run_forever(self) -> None:
         """主循环：reap → 批量自适应领取 → 派发 → 抖动 tick（ADR-004 短轮询）。"""
@@ -125,8 +128,15 @@ class Worker:
                 )
 
     async def _reap_once(self) -> None:
-        """M1.11 接入 reaper.reap_once；本步占位 no-op（挂点位置即最终位置）。"""
-        return
+        """内置 reaper（03 §3.3）：按 reaper_period 节流，经 Clock 计时（FakeClock 可驱动）。"""
+        now = self._clock.now()
+        if (
+            self._last_reap is not None
+            and (now - self._last_reap).total_seconds() < self._tuning.reaper_period_seconds
+        ):
+            return
+        self._last_reap = now
+        await reap_once(self._factory, hooks=self._hooks)
 
     async def _run_node_guarded(self, claimed: ClaimedNode) -> None:
         try:
