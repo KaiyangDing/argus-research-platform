@@ -8,6 +8,7 @@
 import json
 from dataclasses import dataclass
 from datetime import timedelta
+from enum import StrEnum
 from typing import Any, NamedTuple, cast
 
 from sqlalchemy import text
@@ -15,8 +16,16 @@ from sqlalchemy.engine import CursorResult, Result
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from argus.core.types import ArgusError, NodeId, TaskId
-from argus.engine.graph import NodeStatus
-from argus.engine.ports import ArtifactDraft, BudgetHooks, ReplanSignalDraft
+from argus.engine.graph import FailureClass, NodeStatus
+from argus.engine.ports import (
+    ArtifactDraft,
+    BudgetHooks,
+    NodeOutcome,
+    OutcomeDegraded,
+    OutcomeFailure,
+    OutcomeSuccess,
+    ReplanSignalDraft,
+)
 
 
 @dataclass(frozen=True)
@@ -239,5 +248,247 @@ async def commit_done(
         )
         # ⑦ 任务收尾判定
         await _maybe_finalize_task(session, task_id)
+        await session.commit()
+        return True
+
+
+class TerminalKind(StrEnum):
+    """outcome→迁移判定结果（M1 册【实现细则】）。"""
+
+    RETRY = "retry"  # T3b：回 READY
+    DONE = "done"  # T4
+    FAILED = "failed"  # T5
+    NEEDS_REPLAN = "needs_replan"  # T6
+    CANCELLED = "cancelled"  # T7（M1.12 触发）
+
+
+def decide_terminal(
+    outcome: NodeOutcome,
+    *,
+    attempt: int,
+    max_attempts: int,
+    replan_on_failure: bool,
+    cancel_requested: bool,
+) -> TerminalKind:
+    """判定表（冻结区 2.5 #24/#25），纯函数零 IO——M1.13 对抗测试可枚举穷举的前提。"""
+    if cancel_requested:
+        return TerminalKind.CANCELLED  # 取消压倒一切：产物一律丢弃走 T7（03 §2.1）
+    match outcome:
+        case OutcomeSuccess() | OutcomeDegraded():
+            return TerminalKind.DONE
+        case OutcomeFailure() as failure:
+            if failure.replan_signal is not None:
+                return TerminalKind.NEEDS_REPLAN  # T6a：信号压倒重试
+            if failure.retryable and attempt < max_attempts:
+                return TerminalKind.RETRY  # T3b
+            if failure.retryable and replan_on_failure:
+                return TerminalKind.NEEDS_REPLAN  # T6b：重试耗尽转重规划
+            return TerminalKind.FAILED  # T5
+    raise AssertionError(f"unhandled outcome: {outcome!r}")
+
+
+# WHERE 守卫片段：WorkerGuard 逐字 G.3 三条件；ReaperGuard 为前置状态守卫（M1.11 分流②③）
+_WORKER_WHERE = (
+    "id = :node_id AND lease_owner = :worker_id AND attempt = :attempt AND status = 'RUNNING'"
+)
+_REAPER_WHERE = "id = :node_id AND status = 'RUNNING' AND lease_expires_at < now()"
+
+_RETRY_SQL = {  # T3b：非终态——不动 attempt（Z-11）、不动 ready_at、不写 finished_at
+    WorkerGuard: text(
+        f"""
+        UPDATE plan_nodes
+        SET status = 'READY', lease_owner = NULL, lease_expires_at = NULL,
+            error = CAST(:error AS jsonb)
+        WHERE {_WORKER_WHERE}
+        """
+    ),
+    ReaperGuard: text(
+        f"""
+        UPDATE plan_nodes
+        SET status = 'READY', lease_owner = NULL, lease_expires_at = NULL,
+            error = CAST(:error AS jsonb)
+        WHERE {_REAPER_WHERE}
+        """
+    ),
+}
+
+_FAILED_SQL = {  # T5：终态
+    WorkerGuard: text(
+        f"""
+        UPDATE plan_nodes
+        SET status = 'FAILED', failure_class = :failure_class, error = CAST(:error AS jsonb),
+            lease_owner = NULL, lease_expires_at = NULL, finished_at = now()
+        WHERE {_WORKER_WHERE}
+        """
+    ),
+    ReaperGuard: text(
+        f"""
+        UPDATE plan_nodes
+        SET status = 'FAILED', failure_class = :failure_class, error = CAST(:error AS jsonb),
+            lease_owner = NULL, lease_expires_at = NULL, finished_at = now()
+        WHERE {_REAPER_WHERE}
+        """
+    ),
+}
+
+_NEEDS_REPLAN_SQL = {  # T6：滞留态——不写 finished_at
+    WorkerGuard: text(
+        f"""
+        UPDATE plan_nodes
+        SET status = 'NEEDS_REPLAN', failure_class = :failure_class,
+            error = CAST(:error AS jsonb), lease_owner = NULL, lease_expires_at = NULL
+        WHERE {_WORKER_WHERE}
+        """
+    ),
+    ReaperGuard: text(
+        f"""
+        UPDATE plan_nodes
+        SET status = 'NEEDS_REPLAN', failure_class = :failure_class,
+            error = CAST(:error AS jsonb), lease_owner = NULL, lease_expires_at = NULL
+        WHERE {_REAPER_WHERE}
+        """
+    ),
+}
+
+
+def _guard_extra(guard: Guard) -> dict[str, Any]:
+    if isinstance(guard, WorkerGuard):
+        return {"worker_id": guard.worker_id, "attempt": guard.attempt}
+    return {}
+
+
+async def _attempt_of(session: AsyncSession, guard: Guard, node_id: NodeId) -> int:
+    """挂点需要 attempt：worker 路径守卫自带；reaper 路径同事务补查。"""
+    if isinstance(guard, WorkerGuard):
+        return guard.attempt
+    res = await session.execute(
+        text("SELECT attempt FROM plan_nodes WHERE id = :n"), {"n": node_id}
+    )
+    return int(res.scalar_one())
+
+
+async def commit_retry(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    task_id: TaskId,
+    node_id: NodeId,
+    guard: Guard,
+    error: dict[str, Any],
+) -> bool:
+    """03-T3b：可重试失败回 READY。非终态：无工件/信号/收尾判定，不锁任务行。"""
+    async with session_factory() as session:
+        res = await session.execute(
+            _RETRY_SQL[type(guard)],
+            {
+                "node_id": node_id,
+                "error": json.dumps(error, ensure_ascii=False),
+                **_guard_extra(guard),
+            },
+        )
+        if _rowcount(res) == 0:
+            await session.rollback()
+            return False
+        await session.commit()
+        return True
+
+
+async def commit_failed(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    task_id: TaskId,
+    node_id: NodeId,
+    guard: Guard,
+    failure_class: FailureClass,
+    error: dict[str, Any],
+    signal: ReplanSignalDraft | None,
+    hooks: BudgetHooks,
+) -> bool:
+    """03-T5 单事务：FAILED + 信号行（缺省 engine 自动生成）+ 挂点 + 任务收尾判定。"""
+    async with session_factory() as session:
+        await session.execute(_LOCK_TASK_SQL, {"task_id": task_id})
+        res = await session.execute(
+            _FAILED_SQL[type(guard)],
+            {
+                "node_id": node_id,
+                "failure_class": failure_class.value,
+                "error": json.dumps(error, ensure_ascii=False),
+                **_guard_extra(guard),
+            },
+        )
+        if _rowcount(res) == 0:
+            await session.rollback()
+            return False
+        sig = (
+            signal
+            if signal is not None
+            else ReplanSignalDraft(
+                kind="node_replan", severity=2, payload={"cause": failure_class.value}
+            )
+        )
+        await session.execute(
+            _INSERT_SIGNAL_SQL,
+            {
+                "task_id": task_id,
+                "node_id": node_id,
+                "kind": sig.kind,
+                "severity": sig.severity,
+                "payload": json.dumps(sig.payload, ensure_ascii=False),
+            },
+        )
+        await hooks.on_terminal(
+            session,
+            task_id=task_id,
+            node_id=node_id,
+            attempt=await _attempt_of(session, guard, node_id),
+            terminal=NodeStatus.FAILED,
+        )
+        await _maybe_finalize_task(session, task_id)
+        await session.commit()
+        return True
+
+
+async def commit_needs_replan(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    task_id: TaskId,
+    node_id: NodeId,
+    guard: Guard,
+    signal: ReplanSignalDraft,
+    error: dict[str, Any] | None,
+    failure_class: FailureClass | None,
+    hooks: BudgetHooks,
+) -> bool:
+    """03-T6 单事务：滞留态（不写 finished_at）+ 信号行必写 + 挂点；不做任务收尾判定。"""
+    async with session_factory() as session:
+        await session.execute(_LOCK_TASK_SQL, {"task_id": task_id})
+        res = await session.execute(
+            _NEEDS_REPLAN_SQL[type(guard)],
+            {
+                "node_id": node_id,
+                "failure_class": failure_class.value if failure_class is not None else None,
+                "error": json.dumps(error, ensure_ascii=False) if error is not None else None,
+                **_guard_extra(guard),
+            },
+        )
+        if _rowcount(res) == 0:
+            await session.rollback()
+            return False
+        await session.execute(
+            _INSERT_SIGNAL_SQL,
+            {
+                "task_id": task_id,
+                "node_id": node_id,
+                "kind": signal.kind,
+                "severity": signal.severity,
+                "payload": json.dumps(signal.payload, ensure_ascii=False),
+            },
+        )
+        await hooks.on_terminal(
+            session,
+            task_id=task_id,
+            node_id=node_id,
+            attempt=await _attempt_of(session, guard, node_id),
+            terminal=NodeStatus.NEEDS_REPLAN,
+        )
         await session.commit()
         return True
