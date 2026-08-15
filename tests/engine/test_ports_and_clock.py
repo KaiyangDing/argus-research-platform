@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from argus.core.types import ArtifactKind, NodeId, TaskId
+from argus.engine.cancel import CancelToken
 from argus.engine.graph import FailureClass, TaskBrief
 from argus.engine.ports import (
     ArtifactDraft,
@@ -44,8 +45,8 @@ def _ctx(clock: FakeClock, node_id: NodeId | None = None, attempt: int = 1) -> N
         brief=TaskBrief(objective="o"),
         inputs=(),
         budget=NullBudgetView(),
-        cancel_token=None,  # M1.12 落地后收紧为 CancelToken
-        step_journal=None,  # M1.9 落地后收紧为 StepJournal | None
+        cancel_token=CancelToken(),
+        step_journal=None,
         clock=clock,
     )
 

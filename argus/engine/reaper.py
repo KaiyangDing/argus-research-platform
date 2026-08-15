@@ -2,8 +2,8 @@
 
 不是独立进程：每个 worker 内置的周期任务（默认 15s），幂等、多副本并跑无害。
 三分支 attempt 都不 +1（Z-11）；分支①不结算预算（G.5 置换口径：旧预留由下一次
-领取事务原子置换，M2 的 on_claim hook 责任）。分支③依赖 M1.12 的 commit_cancelled，
-本步 stub 占位——绝不写成"回 READY"（G.4③ 明令禁止的事故形态）。
+领取事务原子置换，M2 的 on_claim hook 责任）。分支③：取消中崩溃直接 CANCELLED，
+绝不回 READY（G.4③ 明令禁止的事故形态）。
 """
 
 from typing import NamedTuple
@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from argus.core.types import NodeId, TaskId
 from argus.engine.graph import FailureClass
-from argus.engine.lease import ReaperGuard, commit_failed, commit_needs_replan
+from argus.engine.lease import ReaperGuard, commit_cancelled, commit_failed, commit_needs_replan
 from argus.engine.ports import BudgetHooks, ReplanSignalDraft
 
 
@@ -114,15 +114,18 @@ async def _reap_exhausted(
 async def _reap_cancelled(
     session_factory: async_sessionmaker[AsyncSession], hooks: BudgetHooks
 ) -> int:
-    """分支③：取消中崩溃 → 直接 CANCELLED（TODO(M1.12)：commit_cancelled 落地后回填）。"""
+    """分支③：取消中崩溃 → 直接 CANCELLED，绝不回 READY（G.4③；与 T7 同一代码路径）。"""
     async with session_factory() as session:
         rows = (await session.execute(_BRANCH3_SELECT)).all()
         await session.commit()
     count = 0
     for row in rows:
-        count += 1 if await _commit_cancelled_stub(row.task_id, row.id) else 0
+        ok = await commit_cancelled(
+            session_factory,
+            task_id=TaskId(row.task_id),
+            node_id=NodeId(row.id),
+            guard=ReaperGuard(),
+            hooks=hooks,
+        )
+        count += 1 if ok else 0
     return count
-
-
-async def _commit_cancelled_stub(task_id: object, node_id: object) -> bool:
-    raise NotImplementedError("TODO(M1.12)：commit_cancelled 落地后回填分支③——绝不回 READY（G.4③）")

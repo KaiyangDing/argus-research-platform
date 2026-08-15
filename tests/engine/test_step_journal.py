@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from argus.core.db import build_sessionmaker
 from argus.core.types import NodeId, TaskId
+from argus.engine.cancel import CancelToken
 from argus.engine.graph import BudgetRequest, TaskBrief
 from argus.engine.ports import NodeContext, NullBudgetView, OutcomeSuccess
 from argus.engine.steps import StepJournal, StepKeyMismatch, StepStateError
@@ -67,7 +68,7 @@ def _ctx(task: TaskId, node: NodeId, attempt: int, journal: StepJournal | None) 
         brief=TaskBrief(objective="o"),
         inputs=(),
         budget=NullBudgetView(),
-        cancel_token=None,
+        cancel_token=CancelToken(),
         step_journal=journal,
         clock=FakeClock(datetime(2026, 1, 1, tzinfo=UTC)),
     )

@@ -18,15 +18,18 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
 
+import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from argus.core.config import get_settings
 from argus.core.db import build_engine, build_sessionmaker
+from argus.engine.cancel import CancelToken
 from argus.engine.clock import Clock, SystemClock
 from argus.engine.graph import FailureClass, Purity
 from argus.engine.lease import (
     TerminalKind,
     WorkerGuard,
+    commit_cancelled,
     commit_done,
     commit_failed,
     commit_needs_replan,
@@ -50,6 +53,8 @@ from argus.engine.ports import (
 from argus.engine.reaper import reap_once
 from argus.engine.scheduler import ClaimedNode, claim_batch, compute_batch
 from argus.engine.steps import StepJournal
+
+_LOG = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -150,7 +155,7 @@ class Worker:
         journal: StepJournal | None = None
         if claimed.purity is Purity.EFFECTFUL:
             journal = StepJournal(self._factory, node_id=claimed.node_id, attempt=claimed.attempt)
-        token = asyncio.Event()  # M1.12 收紧为 CancelToken（同 set/is_set/wait 形状）
+        token = CancelToken()
         ctx = NodeContext(
             task_id=claimed.task_id,
             node_id=claimed.node_id,
@@ -181,19 +186,64 @@ class Worker:
                 if hb.cancel_requested:
                     token.set()  # 取消收敛 M1.12 消费；本步先传递信号
 
+        pure_cancelled = False
+        grace_exceeded = False
+
+        async def _cancel_watch() -> None:
+            nonlocal pure_cancelled, grace_exceeded
+            await token.wait()
+            if claimed.purity is Purity.PURE:
+                pure_cancelled = True
+                exec_task.cancel()  # PURE：硬杀无害（03 §7.2）
+                return
+            # EFFECTFUL：等步骤边界自行返回，上限 T_grace（经 clock）
+            await self._clock.sleep(self._tuning.t_grace_seconds)
+            if not exec_task.done():
+                grace_exceeded = True
+                exec_task.cancel()
+
         exec_task = asyncio.create_task(self._execute(ctx, executor, journal))
         hb_task = asyncio.create_task(_hb_loop())
+        watch_task = asyncio.create_task(_cancel_watch())
         outcome: NodeOutcome
+        guard = WorkerGuard(worker_id=self._worker_id, attempt=claimed.attempt)
         try:
             outcome = await exec_task
         except asyncio.CancelledError:
             if lease_lost:
-                return  # 静默丢弃：迟到者不留痕（fencing 反正也会拦）
-            raise  # 外部取消（worker 关停）不吞（03 §7.2）
+                return  # 租约易主：静默丢弃
+            if grace_exceeded:
+                _LOG.warning(
+                    "cancel_grace_exceeded",
+                    node_id=str(claimed.node_id),
+                    grace_seconds=self._tuning.t_grace_seconds,
+                )
+                await commit_failed(
+                    self._factory,
+                    task_id=claimed.task_id,
+                    node_id=claimed.node_id,
+                    guard=guard,
+                    failure_class=FailureClass.CANCEL_TIMEOUT,
+                    error={"cause": "cancel_grace_exceeded"},
+                    signal=None,
+                    hooks=self._hooks,
+                )
+                return
+            if pure_cancelled:
+                await commit_cancelled(
+                    self._factory,
+                    task_id=claimed.task_id,
+                    node_id=claimed.node_id,
+                    guard=guard,
+                    hooks=self._hooks,
+                )
+                return
+            raise  # 外部关停不吞（03 §7.2）
         except Exception as exc:  # noqa: BLE001 —— 03 §4.2⑤：执行体任意异常→结构化可重试失败
             outcome = OutcomeFailure(retryable=True, error=_error_payload(exc))
         finally:
             hb_task.cancel()
+            watch_task.cancel()
         await self._commit(claimed, outcome, cancel_requested=token.is_set())
 
     async def _execute(
@@ -277,7 +327,14 @@ class Worker:
                         hooks=self._hooks,
                     )
             case TerminalKind.CANCELLED:
-                raise NotImplementedError("取消收敛 T7 于 M1.12 接入")
+                # 取消后产物一律丢弃走 T7（冻结区 2.5 #25）——不为迟到的成功开后门
+                await commit_cancelled(
+                    self._factory,
+                    task_id=claimed.task_id,
+                    node_id=claimed.node_id,
+                    guard=guard,
+                    hooks=self._hooks,
+                )
 
 
 async def main(argv: list[str]) -> None:

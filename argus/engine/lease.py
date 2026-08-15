@@ -186,6 +186,20 @@ async def _maybe_finalize_task(session: AsyncSession, task_id: TaskId) -> None:
     await session.execute(_FINALIZE_CANCELLED_SQL, {"task_id": task_id})
 
 
+async def _finalize_after_commit(
+    session_factory: async_sessionmaker[AsyncSession], task_id: TaskId
+) -> None:
+    """C-7 临时口径：并发终态的收尾判定竞态补刀。
+
+    两个终态事务并发时各持任务行 FOR SHARE（兼容），事务内判定在 READ COMMITTED
+    快照里互看不到对方未提交的终态 → 双双空过 → 任务永久 EXECUTING。
+    提交后以独立小事务重跑幂等判定：最后提交者的补刀必见全部已提交终态。
+    残余窗口（commit 与补刀间进程崩溃）待主控裁决兜底方案。"""
+    async with session_factory() as session:
+        await _maybe_finalize_task(session, task_id)
+        await session.commit()
+
+
 async def commit_done(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -249,7 +263,8 @@ async def commit_done(
         # ⑦ 任务收尾判定
         await _maybe_finalize_task(session, task_id)
         await session.commit()
-        return True
+    await _finalize_after_commit(session_factory, task_id)  # C-7 竞态补刀
+    return True
 
 
 class TerminalKind(StrEnum):
@@ -444,7 +459,8 @@ async def commit_failed(
         )
         await _maybe_finalize_task(session, task_id)
         await session.commit()
-        return True
+    await _finalize_after_commit(session_factory, task_id)  # C-7 竞态补刀
+    return True
 
 
 async def commit_needs_replan(
@@ -492,3 +508,54 @@ async def commit_needs_replan(
         )
         await session.commit()
         return True
+
+
+_CANCELLED_SQL = {  # T7：终态——取消产物一律丢弃（冻结区 2.5 #25），无工件无信号
+    WorkerGuard: text(
+        f"""
+        UPDATE plan_nodes
+        SET status = 'CANCELLED', lease_owner = NULL, lease_expires_at = NULL,
+            finished_at = now()
+        WHERE {_WORKER_WHERE}
+        """
+    ),
+    ReaperGuard: text(  # 分支③守卫：过期 + 带取消意图（M1 册 M1.12 接口规格）
+        """
+        UPDATE plan_nodes
+        SET status = 'CANCELLED', lease_owner = NULL, lease_expires_at = NULL,
+            finished_at = now()
+        WHERE id = :node_id AND status = 'RUNNING'
+          AND lease_expires_at < now() AND cancel_requested_at IS NOT NULL
+        """
+    ),
+}
+
+
+async def commit_cancelled(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    task_id: TaskId,
+    node_id: NodeId,
+    guard: Guard,
+    hooks: BudgetHooks,
+) -> bool:
+    """03-T7 单事务：CANCELLED + 清租约 + 挂点（M2: SETTLE 含在途估计 + RELEASE）+ 收尾判定。"""
+    async with session_factory() as session:
+        await session.execute(_LOCK_TASK_SQL, {"task_id": task_id})
+        res = await session.execute(
+            _CANCELLED_SQL[type(guard)], {"node_id": node_id, **_guard_extra(guard)}
+        )
+        if _rowcount(res) == 0:
+            await session.rollback()
+            return False
+        await hooks.on_terminal(
+            session,
+            task_id=task_id,
+            node_id=node_id,
+            attempt=await _attempt_of(session, guard, node_id),
+            terminal=NodeStatus.CANCELLED,
+        )
+        await _maybe_finalize_task(session, task_id)
+        await session.commit()
+    await _finalize_after_commit(session_factory, task_id)  # C-7 竞态补刀
+    return True

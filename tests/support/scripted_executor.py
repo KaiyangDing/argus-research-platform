@@ -41,6 +41,7 @@ class ScriptEntry(BaseModel):
     hang_seconds: float = 3600.0  # hang/timeout 用（经 ctx.clock.sleep，FakeClock 可驱动）
     steps: int = 3  # effectful_steps 用：总步数
     crash_after_step: int | None = None  # 第 k 步 complete 后 raise（崩溃点在步骤边界后）
+    step_seconds: float = 0.0  # effectful_steps 用：每步副作用耗时（经 ctx.clock.sleep）
 
 
 ScriptTable = Mapping[tuple[NodeId, int], ScriptEntry]
@@ -121,8 +122,12 @@ class ScriptedExecutor:
         for step_no in range(from_step + 1, entry.steps + 1):
             begun = await journal.begin(step_no, f"step-{step_no}")
             if not begun.skip:
-                # 模拟副作用发生在这里（M1 无真实 IO），随后打完成标记
+                if entry.step_seconds > 0:
+                    await ctx.clock.sleep(entry.step_seconds)  # 模拟副作用耗时
                 await journal.complete(step_no, f"digest-{step_no}")
             if entry.crash_after_step == step_no:
                 raise RuntimeError(f"scripted crash after step {step_no}")
+            if ctx.cancel_token.is_set():
+                # 步骤边界响应取消（03 §7.2）：不开下一步、自行返回——产物由 T7 丢弃
+                return OutcomeFailure(error={"cause": "cancel_at_step_boundary"}, retryable=False)
         return OutcomeSuccess(artifact=self._artifact(ctx, entry))

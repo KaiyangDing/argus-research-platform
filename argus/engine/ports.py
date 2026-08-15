@@ -11,7 +11,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Final, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +20,10 @@ from argus.core.types import ArtifactKind, ArtifactRef, ContractId, NodeId, Role
 from argus.engine.clock import Clock
 from argus.engine.graph import FailureClass, NodeStatus, TaskBrief
 from argus.engine.steps import StepJournal
+
+if TYPE_CHECKING:
+    from argus.engine.cancel import CancelToken
+
 
 _KIND_DEFAULT_SEVERITY: Final[dict[str, int]] = {
     "node_replan": 2,
@@ -127,7 +131,7 @@ class NodeContext:
     brief: TaskBrief
     inputs: tuple[ArtifactRef, ...]  # M1 不解析（bus 是 M3）
     budget: BudgetView
-    cancel_token: Any  # CancelToken——M1.12 落地后收紧（TYPE_CHECKING 导入）
+    cancel_token: CancelToken  # M1.12 收紧；py3.14 延迟注解下前向引用安全
     step_journal: StepJournal | None  # EFFECTFUL 才注入（M1.9 收紧；PURE 恒 None）
     clock: Clock
 
